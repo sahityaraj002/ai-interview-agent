@@ -6,7 +6,8 @@ export type InterviewResultData = {
   status: "Completed" | "Incomplete";
   durationSeconds: number;
   messages: any[];
-  audioUrl: string | null;
+  recordingUrl: string | null;
+  hasVideo: boolean;
 };
 
 export default function InterviewResult({
@@ -20,15 +21,12 @@ export default function InterviewResult({
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(1);
   const [searchTerm, setSearchTerm] = useState("");
   const [activeFilter, setActiveFilter] = useState<"all" | "candidate" | "ai">("all");
+  const videoRef = useRef<HTMLVideoElement | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const fullTextTranscript = (result.messages || [])
     .map((m: any) => {
-      const isUser =
-        m.type === "userTranscript" ||
-        m.role === "user" ||
-        m.from?.identity === "candidate" ||
-        m.sender === "user";
+      const isUser = m.type === "userTranscript";
       const txt = m.message || m.content?.text || m.content || "";
       const time = m.timestamp ? ` [${new Date(m.timestamp).toLocaleTimeString()}]` : "";
       return `${isUser ? result.candidateName : "AI Interviewer"}${time}:\n${txt}`;
@@ -87,8 +85,9 @@ ${fullTextTranscript}
 
   function handleSpeedChange(speed: number) {
     setPlaybackSpeed(speed);
-    if (audioRef.current) {
-      audioRef.current.playbackRate = speed;
+    const media = videoRef.current || audioRef.current;
+    if (media) {
+      media.playbackRate = speed;
     }
   }
 
@@ -97,11 +96,7 @@ ${fullTextTranscript}
   }
 
   const filteredMessages = (result.messages || []).filter((m: any) => {
-    const isUser =
-      m.type === "userTranscript" ||
-      m.role === "user" ||
-      m.from?.identity === "candidate" ||
-      m.sender === "user";
+    const isUser = m.type === "userTranscript";
 
     if (activeFilter === "candidate" && !isUser) return false;
     if (activeFilter === "ai" && isUser) return false;
@@ -156,21 +151,25 @@ ${fullTextTranscript}
           </div>
         </div>
 
-        {/* Audio Recording & Playback Section */}
-        {result.audioUrl ? (
+        {/* Recording Playback Section */}
+        {result.recordingUrl ? (
           <section className="card result-audio">
             <div className="audio-card-header">
               <div>
-                <span className="pill">SESSION AUDIO</span>
-                <h2>Interview Voice Recording</h2>
-                <p>Full WebRTC high-fidelity candidate and AI interviewer audio recording.</p>
+                <span className="pill">{result.hasVideo ? "SESSION RECORDING" : "SESSION AUDIO"}</span>
+                <h2>{result.hasVideo ? "Interview Video Recording" : "Interview Voice Recording"}</h2>
+                <p>
+                  {result.hasVideo
+                    ? "Candidate camera video, mixed with candidate and AI interviewer audio."
+                    : "Full candidate and AI interviewer audio recording."}
+                </p>
               </div>
               <div className="audio-header-actions">
                 <a
-                  href={result.audioUrl}
-                  download={`interview-audio-${result.candidateName.toLowerCase().replace(/\s+/g, "-")}.webm`}
+                  href={result.recordingUrl}
+                  download={`interview-${result.candidateName.toLowerCase().replace(/\s+/g, "-")}.webm`}
                   className="button secondary sm-btn"
-                  title="Download raw WebM audio"
+                  title="Download raw WebM file"
                 >
                   ⬇ Download Recording (.webm)
                 </a>
@@ -178,8 +177,12 @@ ${fullTextTranscript}
             </div>
 
             <div className="audio-player-group">
-              <audio ref={audioRef} controls src={result.audioUrl} className="main-audio-player" />
-              
+              {result.hasVideo ? (
+                <video ref={videoRef} controls src={result.recordingUrl} className="main-video-player" />
+              ) : (
+                <audio ref={audioRef} controls src={result.recordingUrl} className="main-audio-player" />
+              )}
+
               <div className="playback-speed-controls">
                 <span className="speed-lbl">Speed:</span>
                 {[1, 1.25, 1.5, 2].map((spd) => (
@@ -198,9 +201,9 @@ ${fullTextTranscript}
           <section className="card result-audio empty">
             <div className="audio-card-header">
               <div>
-                <span className="pill">SESSION AUDIO</span>
-                <h2>No Audio Recording Captured</h2>
-                <p>Microphone permissions were either denied or session ended before recording initialized.</p>
+                <span className="pill">SESSION RECORDING</span>
+                <h2>No Recording Captured</h2>
+                <p>Camera/microphone permissions were either denied or session ended before recording initialized.</p>
               </div>
             </div>
           </section>
@@ -291,11 +294,7 @@ ${fullTextTranscript}
               </div>
             ) : (
               filteredMessages.map((message: any, index: number) => {
-                const isUser =
-                  message.type === "userTranscript" ||
-                  message.role === "user" ||
-                  message.from?.identity === "candidate" ||
-                  message.sender === "user";
+                const isUser = message.type === "userTranscript";
                 const text =
                   message.message ||
                   message.content?.text ||

@@ -14,7 +14,11 @@ from livekit.agents import (
     llm,
     StopResponse,
 )
-from livekit.plugins import openai
+from livekit.agents.llm import LLMError
+from livekit.agents.stt import STTError
+from livekit.agents.tts import TTSError
+from livekit.agents.voice import SpeechHandle
+from livekit.plugins import groq
 
 load_dotenv(".env.local")
 load_dotenv(".env")
@@ -24,26 +28,42 @@ logger = logging.getLogger("ai-interviewer")
 
 AGENT_NAME = "ai-interviewer"
 
+DEFAULT_QUESTIONS = [
+    "Tell me about yourself.",
+    "What is your experience with Node.js?",
+    "Tell me about a challenging project you worked on.",
+    "How do you handle database performance issues?",
+]
+
 
 def read_candidate_metadata(ctx: JobContext, participant: Any = None) -> dict[str, Any]:
-    """Read candidate configuration from remote participant or room."""
-    if participant and getattr(participant, "metadata", None):
-        try:
-            data = json.loads(participant.metadata)
-            if isinstance(data, dict) and (data.get("questions") or data.get("candidateName")):
-                return data
-        except json.JSONDecodeError:
-            pass
+    """Build interview config from room metadata (jobTitle/questions, set by the recruiter
+    when the room was created) merged with participant metadata (candidateName, set by
+    whoever actually joins as the candidate). Room metadata is the base so a candidate's
+    identity never overrides the recruiter-configured job/questions; participant metadata
+    is applied on top so the candidate's own name always wins.
+    """
+    config: dict[str, Any] = {}
 
-    for p in ctx.room.remote_participants.values():
-        raw = p.metadata or "{}"
+    def merge(identity: str, raw: str | None) -> None:
+        if not raw:
+            return
         try:
             data = json.loads(raw)
-            if isinstance(data, dict) and (data.get("questions") or data.get("candidateName")):
-                return data
         except json.JSONDecodeError:
-            logger.warning("Invalid candidate metadata from %s", p.identity)
-    return {}
+            logger.warning("Invalid metadata JSON from %s", identity)
+            return
+        if isinstance(data, dict):
+            config.update({k: v for k, v in data.items() if v})
+
+    merge("room", ctx.room.metadata)
+    if participant is not None:
+        merge(participant.identity, getattr(participant, "metadata", None))
+    else:
+        for p in ctx.room.remote_participants.values():
+            merge(p.identity, p.metadata)
+
+    return config
 
 
 class InterviewAgent(Agent):
@@ -95,14 +115,13 @@ Rules:
     async def on_user_turn_completed(
         self, turn_ctx: llm.ChatContext, new_message: llm.ChatMessage
     ) -> None:
+        if self.completed:
+            raise StopResponse()
+
         if not new_message.text_content:
             raise StopResponse()
 
         idx = self.current_index
-
-        if idx >= len(self.questions):
-            raise StopResponse()
-
         self.pending_advance = True
 
         if idx < len(self.questions) - 1:
@@ -128,31 +147,65 @@ Rules:
             "Thanks. Please keep your answer focused on the interview question."
         )
 
-    async def mark_successful_speech(self) -> None:
-        """Advance only after a speech response was successfully created."""
-        if not self.pending_advance or self.completed:
+    async def on_speech_result(self, handle: SpeechHandle, was_pending: bool) -> None:
+        """Advance only after a speech response has actually finished playing successfully.
+
+        `speech_created` (which triggers this) fires the instant a SpeechHandle is created -
+        before the LLM has generated anything or TTS has produced a single frame - not after
+        the pipeline succeeds. Committing state there would advance the question (or close
+        the interview) before knowing whether the response ever actually got spoken. Instead,
+        this waits for the specific handle to finish (`wait_for_playout` never raises; failures
+        show up via `handle.exception()`) and only then decides whether to commit.
+
+        `was_pending` is a snapshot of `pending_advance` taken synchronously at the moment
+        `speech_created` fired, so it always refers to *this* handle - not whatever
+        `pending_advance` happens to be by the time this coroutine resumes.
+        """
+        await handle.wait_for_playout()
+
+        if not was_pending or self.completed:
             return
 
         self.pending_advance = False
 
+        if handle.exception() is not None:
+            # The failure itself is already logged/handled via the "error" event
+            # (handle_pipeline_error); here we just make sure a failed turn never commits.
+            logger.info(
+                "Turn for question %d/%d failed to play out - not advancing",
+                self.current_index + 1,
+                len(self.questions),
+            )
+            return
+
         if self.current_index < len(self.questions) - 1:
             self.current_index += 1
+            logger.info("Advanced to question %d/%d", self.current_index + 1, len(self.questions))
         else:
             self.completed = True
+            logger.info("Final answer played out successfully; closing interview")
             if self._closing_task is None:
                 self._closing_task = asyncio.create_task(self.close_after_grace_period())
 
     async def close_after_grace_period(self) -> None:
-        # Give TTS/audio a short window to finish before closing the agent session.
-        await asyncio.sleep(5)
+        # By this point the closing remarks have already finished playing (this only runs
+        # after on_speech_result confirms successful playout), so this is just a short
+        # buffer for the final audio frames to flush over WebRTC before closing.
+        await asyncio.sleep(2)
         try:
             await self.session.aclose()
         except Exception:
             logger.exception("Error while closing completed interview")
 
-    async def handle_model_error(self, error: Exception) -> None:
-        """Keep the current question unchanged on an LLM/TTS pipeline error."""
-        logger.exception("AI pipeline error: %s", error)
+    async def handle_pipeline_error(self, stage: str, error: Exception) -> None:
+        """Handle STT/LLM/TTS failures without losing interview state.
+
+        The current question index is left untouched (pending_advance is cleared so a
+        stale success can't sneak an advance through after the fact), and a short spoken
+        fallback is given per failing stage. No retry framework - just enough to keep the
+        interview alive and on the right question.
+        """
+        logger.error("%s failure on question %d/%d: %s", stage.upper(), self.current_index + 1, len(self.questions), error)
 
         self.pending_advance = False
 
@@ -160,13 +213,20 @@ Rules:
             return
 
         question = self.questions[self.current_index]
+        fallback = {
+            "stt": "Sorry, I didn't quite catch that. Could you repeat your last answer?",
+            "llm": f"Sorry, I had a brief technical issue. Let's continue: {question}",
+        }.get(stage)
+
+        if fallback is None:
+            # TTS itself is failing - speaking again would likely fail too. Log and wait
+            # for the candidate's next turn rather than compounding the failure.
+            return
+
         try:
-            await self.session.say(
-                "I'm sorry, I had a temporary problem processing that answer. "
-                f"Let's try that question again: {question}"
-            )
+            await self.session.say(fallback)
         except Exception:
-            logger.exception("Fallback speech also failed")
+            logger.exception("Fallback speech also failed after %s error", stage)
 
 
 server = AgentServer()
@@ -176,46 +236,46 @@ server = AgentServer()
 async def entrypoint(ctx: JobContext):
     ctx.log_context_fields = {"room": ctx.room.name}
 
+    await ctx.connect()
+
     # Wait until the candidate participant is present so metadata is available.
     participant = await ctx.wait_for_participant()
 
     config = read_candidate_metadata(ctx, participant)
 
-    candidate_name = str(config.get("candidateName") or "Candidate")
-    job_title = str(config.get("jobTitle") or "Technical Interview")
-    questions = config.get("questions")
-
-    if not isinstance(questions, list) or not questions:
-        questions = [
-            "Tell me about yourself.",
-            "What is your experience with Node.js?",
-            "Tell me about a challenging project you worked on.",
-            "How do you handle database performance issues?",
-        ]
-
-    questions = [str(q).strip() for q in questions if str(q).strip()]
+    candidate_name = str(config.get("candidateName") or participant.name or "Candidate").strip() or "Candidate"
+    job_title = str(config.get("jobTitle") or "Technical Interview").strip() or "Technical Interview"
+    questions = [str(q).strip() for q in (config.get("questions") or []) if str(q).strip()]
+    if not questions:
+        questions = DEFAULT_QUESTIONS
 
     agent = InterviewAgent(candidate_name, job_title, questions)
 
     session = AgentSession(
-        stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
-        llm=openai.responses.LLM(model="gpt-4.1"),
-        tts=openai.TTS(
-            model="gpt-4o-mini-tts",
-            voice="ash",
-            instructions="Speak clearly, professionally, warmly, and at a moderate pace.",
-        ),
+        stt=groq.STT(model="whisper-large-v3-turbo", language="en"),
+        llm=groq.LLM(model="openai/gpt-oss-120b"),
+        tts=groq.TTS(model="canopylabs/orpheus-v1-english", voice="autumn"),
     )
 
     @session.on("speech_created")
     def on_speech_created(event) -> None:
-        # This event means a response has been created by the agent pipeline.
-        asyncio.create_task(agent.mark_successful_speech())
+        # Snapshot pending_advance synchronously, right as the handle is created - not
+        # inside the task, where it could reflect a different (later) turn by the time the
+        # coroutine actually runs.
+        asyncio.create_task(agent.on_speech_result(event.speech_handle, agent.pending_advance))
 
     @session.on("error")
     def on_error(event) -> None:
         error = getattr(event, "error", event)
-        asyncio.create_task(agent.handle_model_error(error))
+        if isinstance(error, STTError):
+            stage = "stt"
+        elif isinstance(error, LLMError):
+            stage = "llm"
+        elif isinstance(error, TTSError):
+            stage = "tts"
+        else:
+            stage = "unknown"
+        asyncio.create_task(agent.handle_pipeline_error(stage, error))
 
     @session.on("user_input_transcribed")
     def on_transcript(event) -> None:
@@ -224,14 +284,18 @@ async def entrypoint(ctx: JobContext):
 
     @session.on("close")
     def on_close(event) -> None:
-        logger.info("Interview session closed: %s", event)
+        # Covers every way the session can end: our own close_after_grace_period() on
+        # normal completion, and the SDK's built-in close_on_disconnect behavior when the
+        # candidate leaves early. Disconnecting here is what actually signals completion to
+        # the candidate's frontend (useAgent().isFinished) and lets this job exit instead of
+        # idling in an empty room.
+        logger.info("Interview session closed: %s", getattr(event, "reason", event))
+        asyncio.create_task(ctx.room.disconnect())
 
     await session.start(
         agent=agent,
         room=ctx.room,
     )
-
-    await ctx.connect()
 
 
 if __name__ == "__main__":

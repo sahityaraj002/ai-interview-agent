@@ -1,42 +1,72 @@
-import {
-  useEffect,
-  useRef,
-  useState,
-  useCallback,
-} from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   BarVisualizer,
   RoomAudioRenderer,
   useAgent,
   useConnectionState,
   useLocalParticipant,
-  useRemoteParticipants,
   useSessionMessages,
   VideoTrack,
 } from "@livekit/components-react";
-import {
-  ConnectionState,
-  RoomEvent,
-  Track,
-  type Room,
-} from "livekit-client";
+import { ConnectionState, RoomEvent, Track, type Room, type RemoteTrack } from "livekit-client";
 import type { InterviewConfig } from "../App";
 import type { InterviewResultData } from "./InterviewResult";
 
 type SessionLike = {
   room?: Room;
-  start: () => Promise<void> | void;
+  start: (options?: any) => Promise<void> | void;
   end: () => Promise<void> | void;
 };
 
 type RecorderState = {
   recorder: MediaRecorder;
   chunks: Blob[];
-  audioContext?: AudioContext;
-  destination?: MediaStreamAudioDestinationNode;
+  audioContext: AudioContext;
+  micStream: MediaStream;
   sourceNodes: AudioNode[];
-  micStream?: MediaStream;
+  remoteSources: Map<string, AudioNode>;
+  onTrackSubscribed: (track: RemoteTrack) => void;
+  onTrackUnsubscribed: (track: RemoteTrack) => void;
+  hasVideo: boolean;
 };
+
+// Waits briefly for the candidate's camera track to actually be published before recording
+// starts, so the video isn't missing its first few seconds (or missing entirely) just
+// because publishing hadn't finished yet when startRecording() ran.
+function waitForLocalCameraTrack(room: Room, timeoutMs = 4000): Promise<MediaStreamTrack | null> {
+  const existing = room.localParticipant.getTrackPublication(Track.Source.Camera);
+  if (existing?.track?.mediaStreamTrack) return Promise.resolve(existing.track.mediaStreamTrack);
+
+  return new Promise((resolve) => {
+    const cleanup = () => {
+      window.clearTimeout(timer);
+      room.off(RoomEvent.LocalTrackPublished, onPublished);
+    };
+    const onPublished = (publication: any) => {
+      if (publication.source === Track.Source.Camera && publication.track?.mediaStreamTrack) {
+        cleanup();
+        resolve(publication.track.mediaStreamTrack);
+      }
+    };
+    const timer = window.setTimeout(() => {
+      cleanup();
+      resolve(null);
+    }, timeoutMs);
+    room.on(RoomEvent.LocalTrackPublished, onPublished);
+  });
+}
+
+// States in which the agent has actually joined and is doing something (as opposed to
+// still connecting, or having finished/failed). Used to tell "the interview genuinely
+// finished" apart from "the agent never showed up in the first place".
+const AGENT_ACTIVE_STATES = new Set([
+  "pre-connect-buffering",
+  "initializing",
+  "idle",
+  "listening",
+  "thinking",
+  "speaking",
+]);
 
 export default function InterviewRoom({
   session,
@@ -50,175 +80,180 @@ export default function InterviewRoom({
   onCancel: () => void;
 }) {
   const connection = useConnectionState(session.room);
-  const { localParticipant } = useLocalParticipant({ room: session.room });
-  const remoteParticipants = useRemoteParticipants({ room: session.room });
+  const agent = useAgent(session as any);
+  const { messages } = useSessionMessages(session as any);
+  const { localParticipant, cameraTrack, isCameraEnabled, lastCameraError } = useLocalParticipant({
+    room: session.room,
+  });
 
-  // Timers & Recording state
-  const [startedAt, setStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [isRecording, setIsRecording] = useState(false);
-  const [recordingDuration, setRecordingDuration] = useState(0);
   const [recordingError, setRecordingError] = useState<string | null>(null);
-  const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
-
-  // UI state
+  const [isMicMuted, setIsMicMuted] = useState(false);
+  const [micAudioLevel, setMicAudioLevel] = useState(0);
   const [isEnding, setIsEnding] = useState(false);
   const [showEndConfirm, setShowEndConfirm] = useState(false);
-  const [activeSideTab, setActiveSideTab] = useState<"transcript" | "agenda" | "participants" | null>("transcript");
-  const [isInviteModalOpen, setIsInviteModalOpen] = useState(false);
-  const [viewMode, setViewMode] = useState<"gallery" | "speaker">("gallery");
-  const [copiedToast, setCopiedToast] = useState<string | null>(null);
-  const [transcriptSearch, setTranscriptSearch] = useState("");
-  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
 
-  // Media Controls
-  const [isMicMuted, setIsMicMuted] = useState(false);
-  const [isVideoEnabled, setIsVideoEnabled] = useState(true);
-  const [isScreenSharing, setIsScreenSharing] = useState(false);
-  const [micAudioLevel, setMicAudioLevel] = useState(0);
-
-  // References
+  // Refs, not state: these back logic that must always see the latest value the instant
+  // it's needed (a Date.now() timestamp, an event handler fired from outside React, a
+  // guard against double-completion) rather than whatever was captured when a closure was
+  // created on some earlier render.
+  const startedAtRef = useRef<number | null>(null);
+  const endingRef = useRef(false);
+  const hasAgentConnectedRef = useRef(false);
   const recorderRef = useRef<RecorderState | null>(null);
-  const lastAgentDisconnected = useRef(false);
-  const recordingTimerRef = useRef<number | null>(null);
-  const transcriptBottomRef = useRef<HTMLDivElement>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+  const transcriptEndRef = useRef<HTMLDivElement>(null);
+  const finishInterviewRef = useRef<((status: "Completed" | "Incomplete") => Promise<void>) | undefined>(undefined);
 
-  const { messages } = useSessionMessages(session as any);
-  const { state: agentState } = useAgent(session as any);
-
-  const shareableUrl =
-    typeof window !== "undefined"
-      ? `${window.location.origin}/?room=${encodeURIComponent(config.roomId)}`
-      : "";
-
-  // Helper for quick toast
-  const showToast = useCallback((msg: string) => {
-    setCopiedToast(msg);
-    setTimeout(() => setCopiedToast(null), 2500);
-  }, []);
-
-  // Compute current question progress
-  const currentQuestionIndex = (() => {
-    if (!messages || messages.length === 0) return 0;
-    // Count AI questions asked
-    const aiMessages = messages.filter((m: any) => {
-      const isUser =
-        m.type === "userTranscript" ||
-        m.role === "user" ||
-        m.from?.identity === "candidate" ||
-        m.sender === "user";
-      return !isUser;
-    });
-    // First message is greeting + Q1, each subsequent speech can advance
-    const count = Math.max(0, aiMessages.length - 1);
-    return Math.min(count, config.questions.length - 1);
-  })();
-
-  // 1. Initialize Interview & Recording
+  // 1. Start the session + recording once.
   useEffect(() => {
     let mounted = true;
 
-    async function startInterview() {
+    (async () => {
       try {
-        await session.start();
-        if (mounted) {
-          setStartedAt(Date.now());
-          await startRecording();
-        }
-      } catch (error) {
+        // Camera runs for the whole interview, start to end; a failed camera publish
+        // (e.g. permission denied) surfaces separately via lastCameraError below and
+        // doesn't block the voice interview itself.
+        await session.start({ tracks: { microphone: { enabled: true }, camera: { enabled: true } } });
+        if (!mounted) return;
+        startedAtRef.current = Date.now();
+        await startRecording();
+      } catch (error: any) {
         console.error("Failed to start interview session:", error);
-        onCancel();
+        if (mounted) {
+          setStartError(
+            error?.name === "NotAllowedError"
+              ? "Microphone access was denied. Please allow microphone access and try again."
+              : error?.message || "Could not connect to the interview room."
+          );
+        }
       }
-    }
-
-    startInterview();
+    })();
 
     return () => {
       mounted = false;
       stopRecording();
-      if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 2. Main Call Duration Timer
+  // 2. Single elapsed-time clock, ticking from the real start timestamp.
   useEffect(() => {
-    if (!startedAt) return;
     const timer = window.setInterval(() => {
-      setElapsed(Math.floor((Date.now() - startedAt) / 1000));
+      if (startedAtRef.current) {
+        setElapsed(Math.floor((Date.now() - startedAtRef.current) / 1000));
+      }
     }, 1000);
     return () => window.clearInterval(timer);
-  }, [startedAt]);
+  }, []);
 
-  // 3. Recording Duration Timer
+  // 3. Auto-scroll transcript.
   useEffect(() => {
-    if (isRecording) {
-      const recTimer = window.setInterval(() => {
-        setRecordingDuration((prev) => prev + 1);
-      }, 1000);
-      recordingTimerRef.current = recTimer;
-      return () => window.clearInterval(recTimer);
-    }
-  }, [isRecording]);
+    transcriptEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
 
-  // 4. Auto-scroll transcript on new message
-  useEffect(() => {
-    if (activeSideTab === "transcript") {
-      transcriptBottomRef.current?.scrollIntoView({ behavior: "smooth" });
-    }
-  }, [messages, activeSideTab]);
-
-  // 5. Mic Audio Level Analyser for Candidate Visualizer
+  // 4. Candidate mic level meter, for the "speaking" indicator.
   useEffect(() => {
     if (!micStreamRef.current || isMicMuted) {
       setMicAudioLevel(0);
       return;
     }
 
+    const stream = micStreamRef.current;
     let audioCtx: AudioContext | null = null;
-    let animFrame: number;
+    let raf = 0;
     try {
-      const stream = micStreamRef.current;
       audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
       const source = audioCtx.createMediaStreamSource(stream);
       const analyser = audioCtx.createAnalyser();
       analyser.fftSize = 64;
       source.connect(analyser);
+      const data = new Uint8Array(analyser.frequencyBinCount);
 
-      const bufferLength = analyser.frequencyBinCount;
-      const dataArray = new Uint8Array(bufferLength);
-
-      const checkLevel = () => {
-        analyser.getByteFrequencyData(dataArray);
-        let sum = 0;
-        for (let i = 0; i < bufferLength; i++) {
-          sum += dataArray[i];
-        }
-        const avg = sum / bufferLength;
-        const normalized = Math.min(100, Math.round((avg / 100) * 100));
-        setMicAudioLevel(normalized);
-        animFrame = requestAnimationFrame(checkLevel);
+      const tick = () => {
+        analyser.getByteFrequencyData(data);
+        const avg = data.reduce((sum, v) => sum + v, 0) / data.length;
+        setMicAudioLevel(Math.min(100, Math.round((avg / 100) * 100)));
+        raf = requestAnimationFrame(tick);
       };
-      checkLevel();
+      tick();
     } catch (err) {
-      console.warn("Audio meter init error:", err);
+      console.warn("Mic level meter unavailable:", err);
     }
 
     return () => {
-      cancelAnimationFrame(animFrame);
+      cancelAnimationFrame(raf);
       audioCtx?.close().catch(() => {});
     };
-  }, [isRecording, isMicMuted]);
+  }, [isMicMuted, isRecording]);
 
-  // Media controls
+  async function finishInterview(status: "Completed" | "Incomplete") {
+    if (endingRef.current) return;
+    endingRef.current = true;
+    setIsEnding(true);
+    setShowEndConfirm(false);
+
+    try {
+      await session.end();
+    } catch (error) {
+      console.error("Session end error:", error);
+    }
+
+    const recording = await stopRecording();
+    const durationSeconds = startedAtRef.current
+      ? Math.floor((Date.now() - startedAtRef.current) / 1000)
+      : elapsed;
+
+    onComplete({
+      candidateName: config.candidateName,
+      jobTitle: config.jobTitle,
+      status,
+      durationSeconds,
+      messages: Array.isArray(messages) ? [...messages] : [],
+      recordingUrl: recording.url,
+      hasVideo: recording.hasVideo,
+    });
+  }
+  finishInterviewRef.current = finishInterview;
+
+  // 5. Candidate's own connection drops (network issue, tab closed, or our own
+  // session.end() from finishInterview) -> fires exactly once, always with the latest
+  // finishInterview via the ref, never a stale closure.
+  useEffect(() => {
+    const room = session.room;
+    if (!room) return;
+    const onDisconnected = () => {
+      finishInterviewRef.current?.("Incomplete");
+    };
+    room.on(RoomEvent.Disconnected, onDisconnected);
+    return () => {
+      room.off(RoomEvent.Disconnected, onDisconnected);
+    };
+  }, [session.room]);
+
+  // 6. Auto-completion: the agent leaves the room (ctx.room.disconnect() on the agent
+  // side, see agent.py) once the interview is done. useAgent() reports that as
+  // state === "disconnected" with isFinished === true. Only trust it once the agent has
+  // actually been seen active - otherwise a dispatch failure would look the same.
+  useEffect(() => {
+    if (AGENT_ACTIVE_STATES.has(agent.state)) {
+      hasAgentConnectedRef.current = true;
+    }
+    if (agent.state === "disconnected" && hasAgentConnectedRef.current) {
+      finishInterviewRef.current?.("Completed");
+    }
+  }, [agent.state]);
+
+  const agentFailed = agent.state === "failed" && !hasAgentConnectedRef.current;
+
   async function toggleMicrophone() {
     if (!session.room) return;
-    const nextState = !isMicMuted;
+    const nextMuted = !isMicMuted;
     try {
-      await session.room.localParticipant.setMicrophoneEnabled(!nextState);
-      setIsMicMuted(nextState);
-      showToast(nextState ? "Microphone Muted" : "Microphone Active");
+      await session.room.localParticipant.setMicrophoneEnabled(!nextMuted);
+      setIsMicMuted(nextMuted);
     } catch (err) {
       console.error("Error toggling microphone:", err);
     }
@@ -226,147 +261,133 @@ export default function InterviewRoom({
 
   async function toggleCamera() {
     if (!session.room) return;
-    const nextState = !isVideoEnabled;
     try {
-      await session.room.localParticipant.setCameraEnabled(nextState);
-      setIsVideoEnabled(nextState);
-      showToast(nextState ? "Camera Turned On" : "Camera Turned Off");
+      await session.room.localParticipant.setCameraEnabled(!isCameraEnabled);
     } catch (err) {
       console.error("Error toggling camera:", err);
     }
   }
 
-  async function toggleScreenShare() {
-    if (!session.room) return;
-    const nextState = !isScreenSharing;
-    try {
-      await session.room.localParticipant.setScreenShareEnabled(nextState);
-      setIsScreenSharing(nextState);
-      showToast(nextState ? "Screen Sharing Started" : "Screen Sharing Stopped");
-    } catch (err) {
-      console.error("Error toggling screen share:", err);
-    }
-  }
-
-  function toggleFullscreen() {
-    if (!document.fullscreenElement) {
-      document.documentElement.requestFullscreen().catch(() => {});
-      setIsFullscreen(true);
-    } else {
-      document.exitFullscreen().catch(() => {});
-      setIsFullscreen(false);
-    }
-  }
-
-  function handleCopyInvite() {
-    navigator.clipboard.writeText(shareableUrl);
-    showToast("✓ Meeting Link Copied!");
-  }
-
-  function handleCopyRoomId() {
-    navigator.clipboard.writeText(config.roomId);
-    showToast("✓ Client ID Copied!");
-  }
-
-  // Audio Recording implementation with mixer
+  // Mixes the candidate's mic with every remote (agent) audio track, plus the candidate's
+  // own camera video (if published), into one recording. Audio mixing is wired directly off
+  // LiveKit's track-subscription events rather than polling the DOM for <audio> elements;
+  // video reuses the same camera track already being published to the room, rather than
+  // opening the camera a second time.
   async function startRecording() {
+    const room = session.room;
+    if (!room) return;
+
     try {
       if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-        setRecordingError("This browser does not support WebRTC audio recording.");
+        setRecordingError("This browser does not support recording.");
         return;
       }
 
       const micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-        },
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
       });
       micStreamRef.current = micStream;
 
       const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
       const destination = audioContext.createMediaStreamDestination();
       const sourceNodes: AudioNode[] = [];
+      const remoteSources = new Map<string, AudioNode>();
 
-      // Connect Candidate Mic to recording destination
       const micSource = audioContext.createMediaStreamSource(micStream);
       micSource.connect(destination);
       sourceNodes.push(micSource);
 
-      // Capture AI / Remote participants audio elements
-      const captureRemoteAudio = () => {
-        const audioElements = Array.from(
-          document.querySelectorAll("audio")
-        ) as HTMLAudioElement[];
-
-        for (const element of audioElements) {
-          if ((element as any).__aiInterviewCaptured) continue;
+      const attach = (track: RemoteTrack) => {
+        if (track.kind !== Track.Kind.Audio || !track.mediaStreamTrack) return;
+        const key = track.sid || track.mediaStreamTrack.id;
+        if (remoteSources.has(key)) return;
+        try {
+          const remoteStream = new MediaStream([track.mediaStreamTrack]);
+          const source = audioContext.createMediaStreamSource(remoteStream);
+          source.connect(destination);
+          remoteSources.set(key, source);
+        } catch (err) {
+          console.warn("Could not mix a remote audio track into the recording:", err);
+        }
+      };
+      const detach = (track: RemoteTrack) => {
+        const key = track.sid || track.mediaStreamTrack?.id;
+        const source = key ? remoteSources.get(key) : undefined;
+        if (source) {
           try {
-            const remoteStream = (element as any).captureStream?.() || (element as any).mozCaptureStream?.();
-            if (remoteStream) {
-              const remoteSource = audioContext.createMediaStreamSource(remoteStream);
-              remoteSource.connect(destination);
-              sourceNodes.push(remoteSource);
-              (element as any).__aiInterviewCaptured = true;
-            }
+            source.disconnect();
           } catch {
-            // Browser security restriction fallback; mic is still recorded
+            /* already disconnected */
           }
+          remoteSources.delete(key!);
         }
       };
 
-      captureRemoteAudio();
-      const poll = window.setInterval(captureRemoteAudio, 1000);
-      window.setTimeout(() => window.clearInterval(poll), 20000);
+      room.remoteParticipants.forEach((participant) => {
+        participant.audioTrackPublications.forEach((pub) => {
+          if (pub.track) attach(pub.track);
+        });
+      });
+      room.on(RoomEvent.TrackSubscribed, attach);
+      room.on(RoomEvent.TrackUnsubscribed, detach);
 
-      const mimeType = MediaRecorder.isTypeSupported("audio/webm;codecs=opus")
-        ? "audio/webm;codecs=opus"
-        : "audio/webm";
+      const cameraTrack = await waitForLocalCameraTrack(room);
+      const recordingStream = new MediaStream([
+        ...(cameraTrack ? [cameraTrack] : []),
+        ...destination.stream.getAudioTracks(),
+      ]);
 
-      const recorder = new MediaRecorder(destination.stream, { mimeType });
+      const candidateMimeTypes = cameraTrack
+        ? ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp8,opus", "video/webm"]
+        : ["audio/webm;codecs=opus", "audio/webm"];
+      const mimeType =
+        candidateMimeTypes.find((type) => MediaRecorder.isTypeSupported(type)) ||
+        (cameraTrack ? "video/webm" : "audio/webm");
+
+      const recorder = new MediaRecorder(recordingStream, { mimeType });
       const state: RecorderState = {
         recorder,
         chunks: [],
         audioContext,
-        destination,
-        sourceNodes,
         micStream,
+        sourceNodes,
+        remoteSources,
+        onTrackSubscribed: attach,
+        onTrackUnsubscribed: detach,
+        hasVideo: Boolean(cameraTrack),
       };
-
       recorder.ondataavailable = (event) => {
-        if (event.data && event.data.size > 0) {
-          state.chunks.push(event.data);
-        }
+        if (event.data.size > 0) state.chunks.push(event.data);
       };
 
       recorder.start(1000);
       recorderRef.current = state;
       setIsRecording(true);
-      setRecordingDuration(0);
     } catch (error: any) {
       console.error("Recording setup failed:", error);
-      setRecordingError(error?.message || "Microphone recording could not be started.");
+      setRecordingError(error?.message || "Recording could not be started.");
     }
   }
 
-  async function stopRecording(): Promise<string | null> {
+  async function stopRecording(): Promise<{ url: string | null; hasVideo: boolean }> {
     setIsRecording(false);
     const state = recorderRef.current;
-    if (!state) return recordingUrl;
+    const room = session.room;
+    if (!state) return { url: null, hasVideo: false };
+    recorderRef.current = null;
+
+    room?.off(RoomEvent.TrackSubscribed, state.onTrackSubscribed);
+    room?.off(RoomEvent.TrackUnsubscribed, state.onTrackUnsubscribed);
 
     const url = await new Promise<string | null>((resolve) => {
       const finish = () => {
         try {
-          const blob = new Blob(state.chunks, { type: "audio/webm" });
-          const createdUrl = URL.createObjectURL(blob);
-          setRecordingUrl(createdUrl);
-          resolve(createdUrl);
+          const blob = new Blob(state.chunks, { type: state.recorder.mimeType || "video/webm" });
+          resolve(URL.createObjectURL(blob));
         } catch {
           resolve(null);
         }
       };
-
       if (state.recorder.state === "inactive") {
         finish();
       } else {
@@ -379,691 +400,192 @@ export default function InterviewRoom({
       }
     });
 
-    state.sourceNodes.forEach((node) => {
-      try { node.disconnect(); } catch {}
+    [...state.sourceNodes, ...state.remoteSources.values()].forEach((node) => {
+      try {
+        node.disconnect();
+      } catch {
+        /* already disconnected */
+      }
     });
-    state.micStream?.getTracks().forEach((track) => track.stop());
-    try {
-      await state.audioContext?.close();
-    } catch {}
-    recorderRef.current = null;
+    state.micStream.getTracks().forEach((track) => track.stop());
+    await state.audioContext.close().catch(() => {});
 
-    return url;
+    return { url, hasVideo: state.hasVideo };
   }
 
-  async function finishInterview(status: "Completed" | "Incomplete") {
-    if (isEnding) return;
-    setIsEnding(true);
-    setShowEndConfirm(false);
+  const statusLabel =
+    agent.state === "speaking"
+      ? "AI Interviewer Speaking"
+      : agent.state === "thinking"
+      ? "AI Processing Response…"
+      : agent.state === "failed"
+      ? "AI Interviewer Failed to Join"
+      : agent.state === "disconnected"
+      ? "Interview Finished"
+      : hasAgentConnectedRef.current
+      ? "AI Listening"
+      : "Connecting AI Interviewer…";
 
-    try {
-      await session.end();
-    } catch (error) {
-      console.error("Session end error:", error);
-    }
-
-    const audioUrl = await stopRecording();
-
-    onComplete({
-      candidateName: config.candidateName,
-      jobTitle: config.jobTitle,
-      status,
-      durationSeconds: elapsed,
-      messages: Array.isArray(messages) ? [...messages] : [],
-      audioUrl,
-    });
+  if (startError) {
+    return (
+      <div className="room-app room-start-error">
+        <div className="modal-card">
+          <div className="modal-header">
+            <h3>Couldn't Start the Interview</h3>
+          </div>
+          <div className="modal-body">
+            <p>{startError}</p>
+          </div>
+          <div className="modal-footer actions-row">
+            <button className="button primary" onClick={onCancel}>
+              Back to Setup
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   }
-
-  // Handle participant disconnection
-  useEffect(() => {
-    const room = session.room;
-    if (!room) return;
-
-    const onDisconnected = () => {
-      if (lastAgentDisconnected.current || isEnding) return;
-      lastAgentDisconnected.current = true;
-      finishInterview("Incomplete");
-    };
-
-    room.on(RoomEvent.Disconnected, onDisconnected);
-    return () => {
-      room.off(RoomEvent.Disconnected, onDisconnected);
-    };
-  }, [session.room, isEnding, messages]);
-
-  const cameraTrack = localParticipant.getTrackPublication(Track.Source.Camera);
-  const totalInCall = 1 + (remoteParticipants?.length || 0) + (agentState ? 1 : 0);
-
-  // Filter messages for search
-  const filteredMessages = (messages || []).filter((m: any) => {
-    if (!transcriptSearch.trim()) return true;
-    const txt = (m.message || m.content?.text || m.content || "").toLowerCase();
-    return txt.includes(transcriptSearch.toLowerCase());
-  });
 
   return (
-    <div className="zoom-app">
-      {/* Toast Alert */}
-      {copiedToast && (
-        <div className="app-toast">
-          <span>{copiedToast}</span>
+    <div className="room-app">
+      <header className="room-header">
+        <div className="room-header-left">
+          <h1 className="room-title">{config.jobTitle}</h1>
+          <span className="room-candidate-badge">👤 {config.candidateName}</span>
         </div>
-      )}
-
-      {/* Top Meeting Header Bar */}
-      <header className="zoom-header">
-        <div className="header-left">
-          {/* Prominent Recording Badge with Live Duration */}
-          <div className={`live-rec-badge ${isRecording ? "active" : "standby"}`}>
-            <span className="rec-dot-animated" />
-            <span className="rec-text">REC</span>
-            <span className="rec-time">{formatDuration(recordingDuration)}</span>
+        <div className="room-header-right">
+          <div className={`rec-badge ${isRecording ? "active" : "standby"}`} title={recordingError || "Session recording"}>
+            <span className="rec-dot" />
+            <span>{isRecording ? "REC" : "REC unavailable"}</span>
           </div>
-
-          <div className="meeting-info-group">
-            <h1 className="meeting-title">{config.jobTitle}</h1>
-            <span className="candidate-badge">👤 {config.candidateName}</span>
+          <div className="header-timer" title="Interview duration">
+            {formatDuration(elapsed)}
           </div>
-        </div>
-
-        <div className="header-center">
-          {/* Question Progress Pill */}
-          <div className="header-question-pill" onClick={() => setActiveSideTab("agenda")} title="View configured questions">
-            <span className="q-pill-label">QUESTION</span>
-            <span className="q-pill-val">
-              {currentQuestionIndex + 1} of {config.questions.length}
-            </span>
-            <div className="q-progress-bar">
-              <div
-                className="q-progress-fill"
-                style={{
-                  width: `${((currentQuestionIndex + 1) / config.questions.length) * 100}%`,
-                }}
-              />
-            </div>
-          </div>
-
-          {/* Client ID / Room Code Badge */}
-          <div
-            className="client-id-badge"
-            onClick={handleCopyRoomId}
-            title="Click to copy Client ID"
-          >
-            <span className="id-label">ROOM CODE:</span>
-            <span className="id-val">{config.roomId}</span>
-            <span className="copy-action-btn">📋</span>
-          </div>
-        </div>
-
-        <div className="header-right">
-          {/* Overall Elapsed Timer */}
-          <div className="header-timer" title="Total Interview Duration">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" />
-              <polyline points="12 6 12 12 16 14" />
-            </svg>
-            <span>{formatDuration(elapsed)}</span>
-          </div>
-
-          {/* WebRTC Connection Status */}
-          <div className="connection-pill" title="LiveKit WebRTC Connection">
+          <div className="connection-pill">
             <span className={`status-dot ${connection === ConnectionState.Connected ? "live" : ""}`} />
-            <span>{connection === ConnectionState.Connected ? "HD Connected" : connection}</span>
+            {connection === ConnectionState.Connected ? "Connected" : connection}
           </div>
-
-          {/* Fullscreen Toggle */}
-          <button
-            className="header-btn"
-            onClick={toggleFullscreen}
-            title={isFullscreen ? "Exit Fullscreen" : "Enter Fullscreen"}
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              {isFullscreen ? (
-                <path d="M8 3v3a2 2 0 0 1-2 2H3m18 0h-3a2 2 0 0 1-2-2V3m0 18v-3a2 2 0 0 1 2-2h3M3 16h3a2 2 0 0 1 2 2v3" />
-              ) : (
-                <path d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
-              )}
-            </svg>
-          </button>
-
-          {/* View Mode Toggle */}
-          <button
-            className="header-btn"
-            onClick={() => setViewMode(viewMode === "gallery" ? "speaker" : "gallery")}
-            title="Toggle Grid / Speaker View"
-          >
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <rect x="3" y="3" width="7" height="7" />
-              <rect x="14" y="3" width="7" height="7" />
-              <rect x="14" y="14" width="7" height="7" />
-              <rect x="3" y="14" width="7" height="7" />
-            </svg>
-            <span>{viewMode === "gallery" ? "Gallery" : "Speaker"}</span>
-          </button>
         </div>
       </header>
 
-      {/* Main Video Call Area */}
-      <div className="zoom-body">
-        <main className={`zoom-stage ${viewMode} ${activeSideTab ? "with-sidebar" : ""}`}>
-          
-          {/* AI Interviewer Video Tile */}
-          <div className={`video-tile ai-tile ${agentState === "speaking" ? "active-speaker" : ""}`}>
-            <div className="ai-orb-stage">
-              <div className={`agent-orb ${agentState || "idle"}`}>
-                <div className="orb-ring ring-1" />
-                <div className="orb-ring ring-2" />
-                <div className="orb-core" />
-              </div>
+      {agentFailed && (
+        <div className="agent-failed-banner">
+          <strong>The AI interviewer could not join the room.</strong>
+          <span>Check that the agent worker is running, then try again.</span>
+          <button className="button secondary sm-btn" onClick={onCancel}>
+            Back to Setup
+          </button>
+        </div>
+      )}
 
-              <div className="ai-status-indicator">
-                <span className={`ai-state-pill ${agentState || "listening"}`}>
-                  {agentState === "speaking"
-                    ? "🔊 AI Interviewer Speaking"
-                    : agentState === "thinking"
-                    ? "⚡ AI Processing Response…"
-                    : "👂 AI Listening to Candidate"}
-                </span>
-              </div>
+      {lastCameraError && (
+        <div className="agent-failed-banner">
+          <strong>Camera unavailable.</strong>
+          <span>Continuing as a voice-only interview - {lastCameraError.message}</span>
+        </div>
+      )}
 
-              <div className="ai-visualizer">
-                <BarVisualizer
-                  state={agentState}
-                  barCount={24}
-                  options={{ minHeight: 8, maxHeight: 60 }}
-                />
-              </div>
-            </div>
-
-            <div className="tile-nameplate">
-              <div className="nameplate-info">
-                <span className="ai-icon-badge">🤖</span>
-                <span className="participant-name">AI Technical Interviewer</span>
-                <span className="role-tag">Host</span>
-              </div>
-              <span className={`audio-wave-dot ${agentState === "speaking" ? "active" : ""}`} />
-            </div>
+      <main className="room-body">
+        <section className="ai-panel">
+          <div className={`agent-orb ${agent.state}`}>
+            <div className="orb-ring ring-1" />
+            <div className="orb-ring ring-2" />
+            <div className="orb-core" />
+          </div>
+          <span className={`ai-state-pill ${agent.state}`}>{statusLabel}</span>
+          <div className="ai-visualizer">
+            <BarVisualizer
+              state={agent.state as any}
+              trackRef={(agent as any).microphoneTrack}
+              barCount={20}
+              options={{ minHeight: 8, maxHeight: 56 }}
+            />
           </div>
 
-          {/* Local Candidate Tile */}
-          <div className={`video-tile candidate-tile ${micAudioLevel > 15 ? "audio-active" : ""}`}>
-            {isVideoEnabled && cameraTrack && cameraTrack.isSubscribed && cameraTrack.track ? (
+          <div className="candidate-pip">
+            {isCameraEnabled && cameraTrack?.track ? (
               <VideoTrack
                 trackRef={{ participant: localParticipant, publication: cameraTrack, source: Track.Source.Camera }}
-                className="video-feed"
+                className="candidate-pip-video"
               />
-            ) : isVideoEnabled ? (
-              <LocalVideoPreview />
             ) : (
-              <div className="avatar-fallback">
-                <div className="avatar-circle">
-                  {config.candidateName.charAt(0).toUpperCase()}
-                </div>
-                <span className="camera-off-label">Camera Turned Off</span>
-              </div>
+              <div className="candidate-pip-fallback">{config.candidateName.charAt(0).toUpperCase()}</div>
             )}
-
-            {/* Candidate Voice Activity Meter */}
-            {!isMicMuted && (
-              <div className="candidate-voice-meter" title="Mic Audio Signal">
-                <div className="meter-bars">
-                  <span className="bar" style={{ height: `${Math.max(15, micAudioLevel * 0.8)}%` }} />
-                  <span className="bar" style={{ height: `${Math.max(25, micAudioLevel * 1.0)}%` }} />
-                  <span className="bar" style={{ height: `${Math.max(15, micAudioLevel * 0.7)}%` }} />
-                </div>
-              </div>
-            )}
-
-            <div className="tile-nameplate">
-              <div className="nameplate-info">
-                <span className="participant-name">{config.candidateName} (You)</span>
-                {isMicMuted ? (
-                  <span className="mute-icon-badge red" title="Microphone Muted">🔇 Muted</span>
-                ) : (
-                  <span className="mute-icon-badge green" title="Microphone Active">🎙️ Active</span>
-                )}
-              </div>
-              {!isMicMuted && micAudioLevel > 12 && (
-                <span className="audio-wave-dot active" />
-              )}
-            </div>
+            <span className="candidate-pip-label">{config.candidateName}</span>
           </div>
+        </section>
 
-          {/* Remote Participants Tiles (if observers/co-interviewers join) */}
-          {remoteParticipants
-            ?.filter((p) => !p.identity.startsWith("agent-"))
-            .map((p) => {
-              const camPub = p.getTrackPublication(Track.Source.Camera);
-              return (
-                <div key={p.identity} className="video-tile remote-tile">
-                  {camPub && camPub.isSubscribed && camPub.track ? (
-                    <VideoTrack
-                      trackRef={{ participant: p, publication: camPub, source: Track.Source.Camera }}
-                      className="video-feed"
-                    />
-                  ) : (
-                    <div className="avatar-fallback">
-                      <div className="avatar-circle">
-                        {(p.name || p.identity).charAt(0).toUpperCase()}
-                      </div>
-                      <span className="camera-off-label">Camera Off</span>
-                    </div>
-                  )}
-                  <div className="tile-nameplate">
-                    <div className="nameplate-info">
-                      <span className="participant-name">{p.name || p.identity}</span>
-                      <span className="role-tag guest">Participant</span>
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-        </main>
-
-        {/* Sidebar Panel */}
-        {activeSideTab && (
-          <aside className="zoom-sidebar">
-            <div className="sidebar-header">
-              <div className="sidebar-tabs">
-                <button
-                  className={`sidebar-tab-btn ${activeSideTab === "transcript" ? "active" : ""}`}
-                  onClick={() => setActiveSideTab("transcript")}
-                >
-                  Transcript ({messages?.length || 0})
-                </button>
-                <button
-                  className={`sidebar-tab-btn ${activeSideTab === "agenda" ? "active" : ""}`}
-                  onClick={() => setActiveSideTab("agenda")}
-                >
-                  Questions ({config.questions.length})
-                </button>
-                <button
-                  className={`sidebar-tab-btn ${activeSideTab === "participants" ? "active" : ""}`}
-                  onClick={() => setActiveSideTab("participants")}
-                >
-                  People ({totalInCall})
-                </button>
+        <section className="transcript-panel">
+          <div className="transcript-header">
+            <h2>Conversation</h2>
+            <span className="transcript-count">{messages?.length || 0} exchanges</span>
+          </div>
+          <div className="messages-stream">
+            {!messages || messages.length === 0 ? (
+              <div className="empty-state">
+                <p>The live transcript will appear here as the interview progresses.</p>
               </div>
-              <button
-                className="close-sidebar-btn"
-                onClick={() => setActiveSideTab(null)}
-                title="Close panel"
-              >
-                ✕
-              </button>
-            </div>
-
-            <div className="sidebar-content">
-              {/* TRANSCRIPT TAB */}
-              {activeSideTab === "transcript" && (
-                <div className="transcript-panel">
-                  <div className="transcript-toolbar">
-                    <div className="search-input-wrap">
-                      <input
-                        type="text"
-                        placeholder="Search conversation…"
-                        value={transcriptSearch}
-                        onChange={(e) => setTranscriptSearch(e.target.value)}
-                        className="transcript-search-input"
-                      />
-                      {transcriptSearch && (
-                        <button className="clear-search" onClick={() => setTranscriptSearch("")}>✕</button>
-                      )}
-                    </div>
-                    <button
-                      className="copy-transcript-sm"
-                      onClick={() => {
-                        const fullText = (messages || [])
-                          .map((m: any) => {
-                            const isUser =
-                              m.type === "userTranscript" ||
-                              m.role === "user" ||
-                              m.from?.identity === "candidate" ||
-                              m.sender === "user";
-                            const txt = m.message || m.content?.text || m.content || "";
-                            return `${isUser ? config.candidateName : "AI Interviewer"}: ${txt}`;
-                          })
-                          .join("\n\n");
-                        navigator.clipboard.writeText(fullText);
-                        showToast("✓ Full Transcript Copied!");
-                      }}
-                      title="Copy full transcript to clipboard"
-                    >
-                      📋 Copy
-                    </button>
-                  </div>
-
-                  <div className="messages-stream">
-                    {!filteredMessages.length ? (
-                      <div className="empty-state">
-                        <div className="empty-icon">💬</div>
-                        <p>
-                          {transcriptSearch
-                            ? "No matching messages found."
-                            : "Real-time speech transcription will stream here automatically."}
-                        </p>
-                      </div>
-                    ) : (
-                      filteredMessages.map((message: any, index: number) => {
-                        const isUser =
-                          message.type === "userTranscript" ||
-                          message.role === "user" ||
-                          message.from?.identity === "candidate" ||
-                          message.sender === "user";
-                        const text =
-                          message.message ||
-                          message.content?.text ||
-                          message.content ||
-                          "";
-
-                        return (
-                          <div className={`chat-bubble ${isUser ? "candidate" : "ai"}`} key={message.id || index}>
-                            <div className="bubble-header">
-                              <span className="bubble-speaker">
-                                {isUser ? `👤 ${config.candidateName}` : "🤖 AI Interviewer"}
-                              </span>
-                              <span className="bubble-time">
-                                {message.timestamp
-                                  ? new Date(message.timestamp).toLocaleTimeString([], {
-                                      hour: "2-digit",
-                                      minute: "2-digit",
-                                      second: "2-digit",
-                                    })
-                                  : ""}
-                              </span>
-                            </div>
-                            <div className="bubble-body">{typeof text === "string" ? text : String(text)}</div>
-                          </div>
-                        );
-                      })
-                    )}
-                    <div ref={transcriptBottomRef} />
-                  </div>
-                </div>
-              )}
-
-              {/* QUESTIONS AGENDA TAB */}
-              {activeSideTab === "agenda" && (
-                <div className="agenda-panel">
-                  <div className="agenda-intro">
-                    <div className="agenda-progress-header">
-                      <h4>Configured Questions</h4>
-                      <span className="agenda-counter">
-                        {currentQuestionIndex + 1} / {config.questions.length}
+            ) : (
+              messages.map((message: any, index: number) => {
+                const isCandidate = message.type === "userTranscript";
+                const text = message.message ?? message.content?.text ?? message.content ?? "";
+                return (
+                  <div className={`chat-bubble ${isCandidate ? "candidate" : "ai"}`} key={message.id || index}>
+                    <div className="bubble-header">
+                      <span className="bubble-speaker">
+                        {isCandidate ? `👤 ${config.candidateName}` : "🤖 AI Interviewer"}
                       </span>
                     </div>
-                    <p>The AI interviewer sequentially navigates each question below.</p>
+                    <div className="bubble-body">{typeof text === "string" ? text : String(text)}</div>
                   </div>
-
-                  <div className="agenda-list">
-                    {config.questions.map((q, idx) => {
-                      const isCurrent = idx === currentQuestionIndex;
-                      const isPassed = idx < currentQuestionIndex;
-
-                      return (
-                        <div
-                          className={`agenda-item ${isCurrent ? "current" : ""} ${isPassed ? "completed" : ""}`}
-                          key={idx}
-                        >
-                          <div className="agenda-num">
-                            {isPassed ? "✓" : idx + 1}
-                          </div>
-                          <div className="agenda-content">
-                            <div className="agenda-status-tag">
-                              {isCurrent ? "CURRENT QUESTION" : isPassed ? "ANSWERED" : `UPCOMING #${idx + 1}`}
-                            </div>
-                            <div className="agenda-text">{q}</div>
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-
-              {/* PARTICIPANTS TAB */}
-              {activeSideTab === "participants" && (
-                <div className="participants-panel">
-                  <div className="participants-list">
-                    <div className="participant-item">
-                      <div className="p-avatar ai">🤖</div>
-                      <div className="p-details">
-                        <div className="p-name">AI Interviewer</div>
-                        <div className="p-role">LiveKit Voice Agent · Host</div>
-                      </div>
-                      <div className="p-status green">Active</div>
-                    </div>
-
-                    <div className="participant-item">
-                      <div className="p-avatar user">
-                        {config.candidateName.charAt(0).toUpperCase()}
-                      </div>
-                      <div className="p-details">
-                        <div className="p-name">{config.candidateName} (You)</div>
-                        <div className="p-role">Candidate</div>
-                      </div>
-                      <div className="p-status">
-                        {isMicMuted ? "Muted" : micAudioLevel > 15 ? "Speaking" : "Active"}
-                      </div>
-                    </div>
-
-                    {remoteParticipants
-                      ?.filter((p) => !p.identity.startsWith("agent-"))
-                      .map((p) => (
-                        <div className="participant-item" key={p.identity}>
-                          <div className="p-avatar guest">
-                            {(p.name || p.identity).charAt(0).toUpperCase()}
-                          </div>
-                          <div className="p-details">
-                            <div className="p-name">{p.name || p.identity}</div>
-                            <div className="p-role">Observer / Co-Host</div>
-                          </div>
-                          <div className="p-status green">Connected</div>
-                        </div>
-                      ))}
-                  </div>
-
-                  <div className="invite-box-sidebar">
-                    <div className="invite-box-title">Share Room Access</div>
-                    <p>Invite interviewers or observers with Code:</p>
-                    <div className="invite-code-pill" onClick={handleCopyRoomId}>
-                      <code>{config.roomId}</code>
-                      <span>Copy</span>
-                    </div>
-                    <button className="button primary sm-btn full" onClick={handleCopyInvite}>
-                      📋 Copy Shareable Link
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          </aside>
-        )}
-      </div>
-
-      {/* Bottom Control Dock */}
-      <footer className="zoom-dock">
-        <div className="dock-group dock-left">
-          {/* Mute Button */}
-          <button
-            className={`dock-btn ${isMicMuted ? "danger" : "active"}`}
-            onClick={toggleMicrophone}
-            title={isMicMuted ? "Unmute Microphone" : "Mute Microphone"}
-          >
-            <div className="dock-icon">
-              {isMicMuted ? (
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <line x1="1" y1="1" x2="23" y2="23" />
-                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
-                  <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" />
-                  <line x1="12" y1="19" x2="12" y2="23" />
-                  <line x1="8" y1="23" x2="16" y2="23" />
-                </svg>
-              ) : (
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
-                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-                  <line x1="12" y1="19" x2="12" y2="23" />
-                  <line x1="8" y1="23" x2="16" y2="23" />
-                </svg>
-              )}
-            </div>
-            <span>{isMicMuted ? "Unmute" : "Mute"}</span>
-          </button>
-
-          {/* Camera Button */}
-          <button
-            className={`dock-btn ${!isVideoEnabled ? "danger" : "active"}`}
-            onClick={toggleCamera}
-            title={isVideoEnabled ? "Turn Camera Off" : "Turn Camera On"}
-          >
-            <div className="dock-icon">
-              {isVideoEnabled ? (
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <polygon points="23 7 16 12 23 17 23 7" />
-                  <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-                </svg>
-              ) : (
-                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" />
-                  <line x1="1" y1="1" x2="23" y2="23" />
-                </svg>
-              )}
-            </div>
-            <span>{isVideoEnabled ? "Stop Video" : "Start Video"}</span>
-          </button>
-        </div>
-
-        <div className="dock-group dock-center">
-          {/* Recording Dock Pill Indicator */}
-          <div className="dock-rec-indicator" title="Audio recording session active">
-            <span className="dock-rec-dot" />
-            <div className="dock-rec-labels">
-              <span className="dock-rec-title">REC AUDIO</span>
-              <span className="dock-rec-duration">{formatDuration(recordingDuration)}</span>
-            </div>
+                );
+              })
+            )}
+            <div ref={transcriptEndRef} />
           </div>
+        </section>
+      </main>
 
-          {/* Screen Share */}
-          <button
-            className={`dock-btn ${isScreenSharing ? "sharing" : ""}`}
-            onClick={toggleScreenShare}
-            title="Share Screen"
-          >
-            <div className="dock-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-                <line x1="8" y1="21" x2="16" y2="21" />
-                <line x1="12" y1="17" x2="12" y2="21" />
-                <path d="M12 7v6M9 10l3-3 3 3" />
-              </svg>
-            </div>
-            <span>{isScreenSharing ? "Stop Share" : "Share Screen"}</span>
-          </button>
+      <footer className="room-dock">
+        <button
+          className={`dock-btn ${isMicMuted ? "danger" : "active"} ${!isMicMuted && micAudioLevel > 15 ? "speaking" : ""}`}
+          onClick={toggleMicrophone}
+          title={isMicMuted ? "Unmute Microphone" : "Mute Microphone"}
+        >
+          {isMicMuted ? "🔇 Unmute" : "🎙️ Mute"}
+        </button>
 
-          {/* Transcript Panel Toggle */}
-          <button
-            className={`dock-btn ${activeSideTab === "transcript" ? "selected" : ""}`}
-            onClick={() => setActiveSideTab(activeSideTab === "transcript" ? null : "transcript")}
-            title="Toggle Live Transcript"
-          >
-            <div className="dock-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-              </svg>
-              {messages?.length > 0 && <span className="dock-badge">{messages.length}</span>}
-            </div>
-            <span>Transcript</span>
-          </button>
+        <button
+          className={`dock-btn ${isCameraEnabled ? "active" : "danger"}`}
+          onClick={toggleCamera}
+          title={isCameraEnabled ? "Turn Camera Off" : "Turn Camera On"}
+        >
+          {isCameraEnabled ? "📷 Camera On" : "🚫 Camera Off"}
+        </button>
 
-          {/* Agenda / Questions */}
-          <button
-            className={`dock-btn ${activeSideTab === "agenda" ? "selected" : ""}`}
-            onClick={() => setActiveSideTab(activeSideTab === "agenda" ? null : "agenda")}
-            title="Toggle Question Sequence"
-          >
-            <div className="dock-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <line x1="8" y1="6" x2="21" y2="6" />
-                <line x1="8" y1="12" x2="21" y2="12" />
-                <line x1="8" y1="18" x2="21" y2="18" />
-                <line x1="3" y1="6" x2="3.01" y2="6" />
-                <line x1="3" y1="12" x2="3.01" y2="12" />
-                <line x1="3" y1="18" x2="3.01" y2="18" />
-              </svg>
-            </div>
-            <span>Questions</span>
-          </button>
-
-          {/* Participants */}
-          <button
-            className={`dock-btn ${activeSideTab === "participants" ? "selected" : ""}`}
-            onClick={() => setActiveSideTab(activeSideTab === "participants" ? null : "participants")}
-            title="Toggle Participants"
-          >
-            <div className="dock-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
-                <circle cx="9" cy="7" r="4" />
-                <path d="M23 21v-2a4 4 0 0 0-3-3.87" />
-                <path d="M16 3.13a4 4 0 0 1 0 7.75" />
-              </svg>
-              <span className="dock-badge">{totalInCall}</span>
-            </div>
-            <span>People ({totalInCall})</span>
-          </button>
-
-          {/* Share / Invite Link */}
-          <button
-            className="dock-btn invite"
-            onClick={() => setIsInviteModalOpen(true)}
-            title="Share Meeting Link & Room Code"
-          >
-            <div className="dock-icon">
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-              </svg>
-            </div>
-            <span>Invite</span>
-          </button>
-        </div>
-
-        <div className="dock-group dock-right">
-          {/* End Call Button */}
-          <button
-            className="end-call-btn"
-            disabled={isEnding}
-            onClick={() => setShowEndConfirm(true)}
-          >
-            End Interview
-          </button>
-        </div>
+        <button className="end-call-btn" disabled={isEnding} onClick={() => setShowEndConfirm(true)}>
+          End Interview
+        </button>
       </footer>
 
-      {/* End Interview Confirmation Modal */}
       {showEndConfirm && (
         <div className="modal-backdrop" onClick={() => setShowEndConfirm(false)}>
           <div className="modal-card confirm-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h3>End Technical Interview?</h3>
-              <button className="close-btn" onClick={() => setShowEndConfirm(false)}>✕</button>
+              <h3>End the Interview?</h3>
+              <button className="close-btn" onClick={() => setShowEndConfirm(false)}>
+                ✕
+              </button>
             </div>
             <div className="modal-body">
-              <p>
-                Are you ready to complete this voice session? Your audio recording and complete transcript will be finalized and compiled into the report.
-              </p>
+              <p>Your recording and transcript so far will be saved to the result screen.</p>
               <div className="end-stats-preview">
                 <div className="stat-item">
                   <span className="stat-lbl">Duration</span>
                   <span className="stat-val">{formatDuration(elapsed)}</span>
                 </div>
                 <div className="stat-item">
-                  <span className="stat-lbl">Questions</span>
-                  <span className="stat-val">{currentQuestionIndex + 1} / {config.questions.length}</span>
-                </div>
-                <div className="stat-item">
-                  <span className="stat-lbl">Transcript Exchanges</span>
+                  <span className="stat-lbl">Exchanges</span>
                   <span className="stat-val">{messages?.length || 0}</span>
                 </div>
               </div>
@@ -1073,94 +595,20 @@ export default function InterviewRoom({
                 Continue Interview
               </button>
               <button className="button danger-btn" onClick={() => finishInterview("Completed")}>
-                Yes, End & Save Report
+                Yes, End Interview
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Invite Modal */}
-      {isInviteModalOpen && (
-        <div className="modal-backdrop" onClick={() => setIsInviteModalOpen(false)}>
-          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h3>Invite Participants to Interview</h3>
-              <button className="close-btn" onClick={() => setIsInviteModalOpen(false)}>✕</button>
-            </div>
-
-            <div className="modal-body">
-              <p className="modal-desc">
-                Share this Room Code or direct link with candidates, observers, or co-interviewers to join this live WebRTC room.
-              </p>
-
-              <div className="invite-field">
-                <label>Room Code / Client ID</label>
-                <div className="copy-field">
-                  <input readOnly value={config.roomId} />
-                  <button
-                    className="button secondary"
-                    onClick={handleCopyRoomId}
-                  >
-                    Copy Code
-                  </button>
-                </div>
-              </div>
-
-              <div className="invite-field">
-                <label>Direct Join URL</label>
-                <div className="copy-field">
-                  <input readOnly value={shareableUrl} />
-                  <button className="button primary" onClick={handleCopyInvite}>
-                    Copy Link
-                  </button>
-                </div>
-              </div>
-            </div>
-
-            <div className="modal-footer">
-              <button className="button secondary full" onClick={() => setIsInviteModalOpen(false)}>
-                Done
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Audio Renderer for LiveKit remote streams */}
       <RoomAudioRenderer />
     </div>
   );
 }
 
-function LocalVideoPreview() {
-  const videoRef = useRef<HTMLVideoElement>(null);
-
-  useEffect(() => {
-    let stream: MediaStream | null = null;
-    async function startCamera() {
-      try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      } catch (err) {
-        console.warn("Camera preview unavailable:", err);
-      }
-    }
-    startCamera();
-    return () => {
-      stream?.getTracks().forEach((t) => t.stop());
-    };
-  }, []);
-
-  return <video ref={videoRef} autoPlay playsInline muted className="video-feed local-feed" />;
-}
-
 function formatDuration(seconds: number) {
-  const mins = Math.floor(seconds / 60)
-    .toString()
-    .padStart(2, "0");
+  const mins = Math.floor(seconds / 60).toString().padStart(2, "0");
   const secs = (seconds % 60).toString().padStart(2, "0");
   return `${mins}:${secs}`;
 }

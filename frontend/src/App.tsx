@@ -1,44 +1,35 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { TokenSource } from "livekit-client";
 import {
   SessionProvider,
   useSession,
 } from "@livekit/components-react";
-import InterviewSetup from "./components/InterviewSetup";
+import CreateInterview from "./components/CreateInterview";
+import JoinInterview from "./components/JoinInterview";
 import InterviewRoom from "./components/InterviewRoom";
 import InterviewResult, {
   type InterviewResultData,
 } from "./components/InterviewResult";
+import { TOKEN_ENDPOINT } from "./api";
 
 export type InterviewConfig = {
   roomId: string;
   candidateName: string;
   jobTitle: string;
   questions: string[];
-  role?: "host" | "candidate" | "interviewer" | "guest";
 };
 
-const TOKEN_ENDPOINT =
-  import.meta.env.VITE_TOKEN_ENDPOINT || "/api/getToken";
-
+function getRoomIdFromUrl(): string | null {
+  if (typeof window === "undefined") return null;
+  return new URLSearchParams(window.location.search).get("room");
+}
 
 export default function App() {
   const [config, setConfig] = useState<InterviewConfig | null>(null);
   const [result, setResult] = useState<InterviewResultData | null>(null);
-  const [initialRoomId, setInitialRoomId] = useState<string>("");
+  const [roomIdFromUrl] = useState<string | null>(getRoomIdFromUrl);
 
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const roomParam = params.get("room") || params.get("clientId") || params.get("roomId");
-    if (roomParam) {
-      setInitialRoomId(roomParam);
-    }
-  }, []);
-
-  const tokenSource = useMemo(
-    () => TokenSource.endpoint(TOKEN_ENDPOINT),
-    []
-  );
+  const tokenSource = useMemo(() => TokenSource.endpoint(TOKEN_ENDPOINT), []);
 
   if (result) {
     return (
@@ -47,10 +38,9 @@ export default function App() {
         onNewInterview={() => {
           setResult(null);
           setConfig(null);
-          // clear query param without reload
           if (window.history.replaceState) {
-            const url = window.location.protocol + "//" + window.location.host + window.location.pathname;
-            window.history.replaceState({ path: url }, "", url);
+            const url = window.location.origin + window.location.pathname;
+            window.history.replaceState({}, "", url);
           }
         }}
       />
@@ -58,13 +48,12 @@ export default function App() {
   }
 
   if (!config) {
-    return (
-      <InterviewSetup
-        initialRoomId={initialRoomId}
-        onStart={(nextConfig) => {
-          setConfig(nextConfig);
-        }}
-      />
+    // A shared interview link (?room=...) always leads to the candidate join screen -
+    // never to the recruiter's create/configure form.
+    return roomIdFromUrl ? (
+      <JoinInterview roomId={roomIdFromUrl} onJoin={setConfig} />
+    ) : (
+      <CreateInterview />
     );
   }
 
@@ -91,15 +80,10 @@ function SessionShell({
 }) {
   const session = useSession(tokenSource, {
     roomName: config.roomId,
-    agentName: "ai-interviewer",
     participantName: config.candidateName,
-    participantMetadata: JSON.stringify({
-      candidateName: config.candidateName,
-      jobTitle: config.jobTitle,
-      questions: config.questions,
-      roomId: config.roomId,
-      role: config.role || "candidate",
-    }),
+    // Only the candidate's own identity - jobTitle/questions already live in the room's
+    // metadata, set by the recruiter when the interview was created.
+    participantMetadata: JSON.stringify({ candidateName: config.candidateName }),
   });
 
   return (
