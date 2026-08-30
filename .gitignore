@@ -40,6 +40,8 @@ wheels/
 dist/
 dist-ssr/
 coverage/
+*.tsbuildinfo
+
 
 # Logs
 logs

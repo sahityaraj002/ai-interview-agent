@@ -181,7 +181,44 @@ Open the URL shown by Vite, normally:
 http://localhost:5173
 ```
 
-## 4. Interview flow
+## 4. Deploying to Vercel (Production)
+
+The repository is configured for unified deployment on [Vercel](https://vercel.com). Vercel builds the React frontend and serves the LiveKit Token endpoint as a Serverless Function (`/api/getToken`).
+
+### Option A: 1-Click via GitHub + Vercel Dashboard
+
+1. Push your repository to GitHub (`https://github.com/sahityaraj002/ai-interview-agent.git`).
+2. Go to [Vercel Dashboard](https://vercel.com/new) and click **"Add New Project"**.
+3. Import your `ai-interview-agent` repository.
+4. In **Project Settings > Environment Variables**, add the following 3 variables:
+   - `LIVEKIT_URL` (e.g. `wss://your-project.livekit.cloud`)
+   - `LIVEKIT_API_KEY` (e.g. `API...`)
+   - `LIVEKIT_API_SECRET` (e.g. `secret...`)
+5. Click **Deploy**. Vercel will build and assign your production URL (e.g., `https://ai-interview-agent.vercel.app`).
+
+### Option B: Deploy via Vercel CLI
+
+```bash
+# Log in to Vercel
+npx vercel login
+
+# Deploy to preview
+npx vercel
+
+# Deploy to production
+npx vercel --prod
+```
+
+When prompted, set the environment variables (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`) in your Vercel project dashboard or via `npx vercel env add`.
+
+### Running the Python Voice Agent
+
+The LiveKit Agent (`agent/agent.py`) establishes an outbound WebSocket connection to your LiveKit Cloud project:
+
+- **For local testing with the live Vercel URL:** Keep `python agent.py dev` running in your terminal. LiveKit Cloud will automatically route candidate audio from your live Vercel web app to your running agent worker!
+- **For 24/7 cloud hosting:** You can deploy `agent/agent.py` to LiveKit Cloud Agent Hosting, Railway, Render, Fly.io, or Docker using the provided `Dockerfile`.
+
+## 5. Interview flow
 
 1. Candidate enters name.
 2. Candidate enters job title.
@@ -203,7 +240,7 @@ http://localhost:5173
 
 The required basic flow and ordered-question behavior come directly from the assignment. fileciteturn0file0L11-L31 fileciteturn0file0L34-L42
 
-## 5. Why these AI providers?
+## 6. Why these AI providers?
 
 ### STT — OpenAI `gpt-4o-mini-transcribe`
 
@@ -219,7 +256,7 @@ LiveKit documents this model in its OpenAI TTS plugin, including the `voice` and
 
 Using one provider for all three layers keeps the assignment simple and reduces integration complexity while still demonstrating the required STT → LLM → TTS architecture.
 
-## 6. Candidate metadata
+## 7. Candidate metadata
 
 The frontend sends a payload like:
 
@@ -240,7 +277,7 @@ This follows the assignment's candidate-information structure. filecitetur
 
 The agent reads the participant metadata instead of hard-coding the questions into the conversation itself.
 
-## 7. Failure handling
+## 8. Failure handling
 
 ### STT failure
 
@@ -260,7 +297,7 @@ The agent session closes naturally when the room/session ends. The frontend stop
 
 The assignment explicitly asks for basic handling of STT, LLM, TTS failures and early candidate departure, without requiring a complex retry framework. fileciteturn0file0L75-L87
 
-## 8. Problem-solving question
+## 9. Problem-solving question
 
 **Scenario:** The candidate is answering question 2 and the LLM request fails.
 
@@ -284,7 +321,7 @@ The question index lives inside the running agent instance and is only committed
 
 This directly addresses the assignment's requested reasoning. fileciteturn0file0L137-L152
 
-## 9. Audio recording
+## 10. Audio recording
 
 The assignment allows local recording or cloud storage and explicitly says production-grade recording is not required. fileciteturn0file0L106-L114
 
@@ -292,7 +329,7 @@ This implementation uses browser-side `MediaRecorder` and combines the candidate
 
 For production, move recording to LiveKit Egress or another controlled storage system.
 
-## 10. What is intentionally NOT implemented
+## 11. What is intentionally NOT implemented
 
 The assignment says these are not required:
 
@@ -310,7 +347,8 @@ The assignment says these are not required:
 
 So this project stays focused on the working interviewer rather than adding unrelated infrastructure. fileciteturn0file0L238-L251
 
-## 11. Demo checklist
+## 12. Demo checklist
+
 
 Record a demo showing:
 

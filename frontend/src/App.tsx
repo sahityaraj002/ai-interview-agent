@@ -19,7 +19,8 @@ export type InterviewConfig = {
 };
 
 const TOKEN_ENDPOINT =
-  import.meta.env.VITE_TOKEN_ENDPOINT || "http://localhost:3001/getToken";
+  import.meta.env.VITE_TOKEN_ENDPOINT || "/api/getToken";
+
 
 export default function App() {
   const [config, setConfig] = useState<InterviewConfig | null>(null);
