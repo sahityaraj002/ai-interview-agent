@@ -6,7 +6,7 @@ at a time over voice, and produces a transcript and video recording at the end.
 
 > **Not hearing the AI speak?** This is almost always one specific setup step, not a bug:
 > Groq's TTS model requires a one-time terms acceptance per account before it will
-> synthesize any audio. See section 5 below - `console.groq.com/playground?model=canopylabs%2Forpheus-v1-english`.
+> synthesize any audio. See section 6 below - `console.groq.com/playground?model=canopylabs%2Forpheus-v1-english`.
 > Until that's accepted, the agent generates and logs its questions correctly but every TTS
 > call fails with `model_terms_required`, so nothing is ever spoken.
 
@@ -69,14 +69,21 @@ influence via its token request).
 
 ```text
 ai-interview-agent/
-├── agent/            # Python LiveKit Agents worker
+├── agent/            # Python LiveKit Agents worker (must run on its own host - never Vercel)
 │   ├── agent.py
 │   ├── requirements.txt
 │   └── .env.example
-├── backend/           # Express token/health API
+├── backend/           # Express token/health API for local dev
 │   ├── src/server.js
+│   ├── src/interview-service.js   (shared LiveKit logic, also used by api/)
 │   ├── package.json
 │   └── .env.example
+├── api/               # Vercel serverless functions (production deployment target)
+│   ├── health.js
+│   ├── createInterview.js
+│   ├── getToken.js
+│   └── interview/[roomName].js
+├── vercel.json
 ├── frontend/          # React + Vite UI
 │   ├── src/
 │   │   ├── components/
@@ -99,7 +106,7 @@ ai-interview-agent/
 - Node.js 20+
 - Python 3.10+
 - A LiveKit Cloud project (URL, API key, API secret)
-- A Groq API key (free, no credit card - see section 5 below)
+- A Groq API key (free, no credit card - see section 6 below)
 - A modern browser with microphone and camera permission (camera is optional - denying it
   degrades to a voice-only interview rather than blocking it)
 
@@ -173,7 +180,38 @@ npm run dev
 
 Open the URL Vite prints (normally `http://localhost:5173`).
 
-## 4. Interview flow
+## 4. Deploying to Vercel
+
+Vercel hosts the **frontend and the token/room API** (the `api/` serverless functions,
+which reuse the exact same `backend/src/interview-service.js` logic as the local Express
+server - not a separate copy). **Vercel cannot host the Python agent** - serverless
+functions are short-lived request/response handlers, not a persistent worker process. The
+agent still has to run somewhere that stays up: your own machine (`python agent.py dev`),
+a small always-on VM, or a host like Railway/Render/Fly.io, connected to the *same* LiveKit
+project as the deployed site. Without the agent running somewhere, a deployed interview
+link will create a room and let a candidate join, but no AI will ever show up.
+
+**Steps:**
+1. Push this repo to GitHub (already done here - `origin/main`).
+2. In the [Vercel dashboard](https://vercel.com/new), import the repository. Leave the
+   project root as the repo root (not `frontend/`) - `vercel.json` and `api/` both expect
+   to be at the top level.
+3. Add these three environment variables in Project Settings → Environment Variables
+   (same project the agent connects to):
+   - `LIVEKIT_URL`
+   - `LIVEKIT_API_KEY`
+   - `LIVEKIT_API_SECRET`
+4. Deploy. Vercel runs `npm run build` (root `package.json`), which builds `frontend/` and
+   copies `frontend/dist` to a root `dist/`; `vercel.json` routes `/api/*` to the serverless
+   functions and everything else to the SPA.
+5. Start (or keep running) the agent worker pointed at the same LiveKit project, with a
+   real `GROQ_API_KEY` (and the Groq TTS terms accepted - see section 6). The deployed site
+   and the agent only need to agree on the LiveKit project, not on where they're hosted.
+
+`VITE_TOKEN_ENDPOINT` does not need to be set in Vercel - the frontend's default
+(`/api/getToken`) already resolves correctly against whatever domain Vercel serves it from.
+
+## 5. Interview flow
 
 **Recruiter (create):**
 1. Opens the app at `/`, picks a job title, edits the question list, clicks "Create
@@ -209,7 +247,7 @@ here means structural, not identity-verified - possession of the link is what ma
 candidate, and the link's room id is the only credential involved. The room closes itself
 2 hours after creation if nobody joins (`emptyTimeout` in `backend/src/server.js`).
 
-## 5. Why these AI providers?
+## 6. Why these AI providers?
 
 **STT — Groq `whisper-large-v3-turbo`**, **LLM — Groq `openai/gpt-oss-120b`**,
 **TTS — Groq `canopylabs/orpheus-v1-english`**. Groq runs all three on its own LPU hardware
@@ -227,7 +265,7 @@ change in `agent/agent.py`.
 > account/org at `console.groq.com/playground?model=canopylabs%2Forpheus-v1-english` -
 > without it, TTS fails with a `model_terms_required` error.
 
-## 6. Candidate metadata
+## 7. Candidate metadata
 
 Configuration is split across two LiveKit metadata scopes, matching who actually knows
 each piece of information and when:
@@ -254,7 +292,7 @@ The agent merges both (room metadata as the base, participant metadata layered o
 the candidate's own identity is never something they could use to overwrite the
 recruiter-configured role or questions.
 
-## 7. Failure handling
+## 8. Failure handling
 
 The interview's state machine only ever commits an advance to the next question
 (`current_index`) *after* the response has actually finished being spoken successfully.
@@ -282,7 +320,7 @@ closing statement is guaranteed to have fully played before the session closes.
   losing the LiveKit connection immediately produces an "Incomplete" result with whatever
   transcript/recording was captured up to that point.
 
-## 8. Problem-solving question
+## 9. Problem-solving question
 
 **Scenario:** The candidate is answering question 2 and the LLM request fails.
 
@@ -311,7 +349,7 @@ Because the question list itself comes from room metadata (not the agent's momen
 conversation state), even a full agent restart could reconstruct where the candidate should
 resume.
 
-## 9. What is intentionally not implemented
+## 10. What is intentionally not implemented
 
 Per the assignment: candidate scoring, cheating detection, ECS/Kubernetes/auto-scaling,
 DynamoDB, authentication, billing, complex dashboards, CI/CD, and production
@@ -320,7 +358,7 @@ no multi-party/observer mode - since the assignment describes an AI-conducted in
 not a video conferencing product; the candidate's camera is on so the recording captures
 them, not because a second human is meant to be watching live.
 
-## 10. Recording
+## 11. Recording
 
 Recording is done client-side: the candidate's microphone and the AI's incoming audio
 track(s) are mixed via the Web Audio API into a single audio stream, and the candidate's own
@@ -331,7 +369,7 @@ unsupported), played back on the result screen. This matches the assignment's al
 local, non-production-grade recording. For production, this would move server-side to
 LiveKit Egress.
 
-## 11. Demo checklist
+## 12. Demo checklist
 
 ```text
 Start Interview → AI greets candidate by name → AI asks question 1 → candidate answers →
