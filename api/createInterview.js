@@ -9,8 +9,10 @@ export default async function handler(req, res) {
   try {
     res.status(201).json(await createInterview(req.body || {}));
   } catch (error) {
-    if (error instanceof ServiceError) return res.status(error.status).json({ error: error.message });
+    if (error instanceof ServiceError || error?.status) {
+      return res.status(error.status || 400).json({ error: error.message });
+    }
     console.error("Create interview error:", error);
-    res.status(500).json({ error: "Failed to create the interview room." });
+    res.status(500).json({ error: error?.message || "Failed to create the interview room." });
   }
 }

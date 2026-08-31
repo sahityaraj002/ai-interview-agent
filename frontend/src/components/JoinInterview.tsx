@@ -25,6 +25,14 @@ export default function JoinInterview({
     (async () => {
       try {
         const res = await fetch(`${API_BASE}/interview/${encodeURIComponent(roomId)}`);
+        const contentType = res.headers.get("content-type") || "";
+        if (!contentType.includes("application/json")) {
+          throw new Error(
+            res.status === 404
+              ? "This interview link is invalid or has expired."
+              : "Unable to reach the interview service. Please verify the backend is running."
+          );
+        }
         const body = await res.json();
         if (!res.ok) throw new Error(body.error || "This interview link is invalid or has expired.");
         if (!cancelled) setLookup({ status: "ready", jobTitle: body.jobTitle });

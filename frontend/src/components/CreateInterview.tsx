@@ -71,6 +71,10 @@ export default function CreateInterview() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jobTitle: jobTitle.trim(), questions: cleaned }),
       });
+      const contentType = res.headers.get("content-type") || "";
+      if (!contentType.includes("application/json")) {
+        throw new Error("Unable to reach the interview service. Please verify the backend is running and configured.");
+      }
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || "Failed to create the interview.");
 
